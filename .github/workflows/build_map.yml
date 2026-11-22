@@ -1,0 +1,250 @@
+name: Build Valhalla Offline Maps
+
+on:
+  workflow_dispatch:
+    inputs:
+      department:
+        description: 'Zone ou départements (ex: 07,26 ou all_rhone_alpes, grand_sud_est, paca, aura)'
+        required: true
+        default: '07,26'
+        type: string
+      build_mode:
+        description: 'Mode : modular_zone (1 build cohérent découpé par dép., recommandé pour inter-dép/inter-région) ou single_dept (isolé)'
+        required: true
+        default: 'modular_zone'
+        type: choice
+        options:
+          - modular_zone
+          - single_dept
+      release_tag:
+        description: 'Tag de la release GitHub (par défaut: maps-v1)'
+        required: true
+        default: 'maps-v1'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install osmium-tool (for coherent multi-PBF merge)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq osmium-tool python3
+
+      - name: Prepare build environment
+        run: |
+          mkdir -p custom_files
+          mkdir -p pbf_downloads
+          mkdir -p release_assets
+
+      - name: Download OSM PBF extracts and Build Coherent Valhalla Tiles
+        run: |
+          set -euo pipefail
+
+          # Table de mapping : Code Département -> Région OSM France : Slug PBF : minLat : maxLat : minLon : maxLon
+          declare -A DEPT_MAP=(
+            ["01"]="rhone_alpes:ain:45.60:46.55:4.75:6.20"
+            ["03"]="auvergne:allier:45.90:46.85:2.25:4.05"
+            ["04"]="provence_alpes_cote_d_azur:alpes_de_haute_provence:43.65:44.70:5.45:6.98"
+            ["05"]="provence_alpes_cote_d_azur:hautes_alpes:44.15:45.15:5.35:7.10"
+            ["06"]="provence_alpes_cote_d_azur:alpes_maritimes:43.45:44.40:6.60:7.75"
+            ["07"]="rhone_alpes:ardeche:44.20:45.40:3.80:4.92"
+            ["13"]="provence_alpes_cote_d_azur:bouches_du_rhone:43.15:43.95:4.20:5.85"
+            ["15"]="auvergne:cantal:44.60:45.50:2.05:3.40"
+            ["2A"]="corse:corse_du_sud:41.30:42.40:8.50:9.50"
+            ["2B"]="corse:haute_corse:41.80:43.05:8.55:9.60"
+            ["26"]="rhone_alpes:drome:44.10:45.35:4.65:5.85"
+            ["30"]="languedoc_roussillon:gard:43.45:44.50:3.25:4.88"
+            ["34"]="languedoc_roussillon:herault:43.20:43.98:2.50:4.25"
+            ["38"]="rhone_alpes:isere:44.65:45.90:4.70:6.38"
+            ["42"]="rhone_alpes:loire:45.20:46.30:3.65:4.78"
+            ["43"]="auvergne:haute_loire:44.70:45.45:3.05:4.52"
+            ["48"]="languedoc_roussillon:lozere:44.10:44.98:2.95:4.02"
+            ["63"]="auvergne:puy_de_dome:45.25:46.30:2.35:3.98"
+            ["69"]="rhone_alpes:rhone:45.40:46.35:4.20:5.20"
+            ["73"]="rhone_alpes:savoie:45.05:45.95:5.60:7.20"
+            ["74"]="rhone_alpes:haute_savoie:45.65:46.45:5.78:7.08"
+            ["83"]="provence_alpes_cote_d_azur:var:42.95:43.85:5.65:6.98"
+            ["84"]="provence_alpes_cote_d_azur:vaucluse:43.65:44.45:4.62:5.80"
+          )
+
+          RAW_INPUT="${{ github.event.inputs.department }}"
+          BUILD_MODE="${{ github.event.inputs.build_mode }}"
+          CLEAN_INPUT=$(echo "$RAW_INPUT" | tr '[:upper:]' '[:lower:]' | xargs)
+
+          TARGET_DEPTS=()
+          case "${CLEAN_INPUT}" in
+            "all_rhone_alpes"|"rhone_alpes")
+              TARGET_DEPTS=(01 07 26 38 42 69 73 74)
+              ;;
+            "aura")
+              TARGET_DEPTS=(01 07 26 38 42 69 73 74 03 15 43 63)
+              ;;
+            "paca")
+              TARGET_DEPTS=(04 05 06 13 83 84)
+              ;;
+            "grand_sud_est")
+              TARGET_DEPTS=(01 07 26 38 42 69 73 74 04 05 06 13 83 84 30 48)
+              ;;
+            "corse")
+              TARGET_DEPTS=(2A 2B)
+              ;;
+            *)
+              IFS=',' read -ra RAW_LIST <<< "$RAW_INPUT"
+              for d in "${RAW_LIST[@]}"; do
+                code=$(echo "$d" | cut -d'_' -f1 | tr '[:lower:]' '[:upper:]' | xargs)
+                if [ ${#code} -eq 1 ] && [[ "$code" =~ ^[0-9]$ ]]; then
+                  code="0$code"
+                fi
+                TARGET_DEPTS+=("$code")
+              done
+              ;;
+          esac
+
+          echo "Mode: ${BUILD_MODE} | Départements: ${TARGET_DEPTS[*]}"
+
+          if [ "${BUILD_MODE}" = "single_dept" ]; then
+            for code in "${TARGET_DEPTS[@]}"; do
+              IFS=':' read -r region slug _ _ _ _ <<< "${DEPT_MAP[$code]}"
+              pbf_url="https://download.openstreetmap.fr/extracts/europe/france/${region}/${slug}-latest.osm.pbf"
+              rm -rf custom_files/*
+              curl -L -f --progress-bar -o "custom_files/${slug}-latest.osm.pbf" "${pbf_url}"
+              docker run --rm \
+                -v "$(pwd)/custom_files:/custom_files" \
+                -e build_elevation=False \
+                -e build_admins=True \
+                -e build_time_zones=True \
+                -e use_tiles_ignore_pbf=False \
+                -e serve_tiles=False \
+                ghcr.io/gis-ops/docker-valhalla/valhalla:latest
+              mv "custom_files/valhalla_tiles.tar" "release_assets/valhalla_tiles_${code}.tar"
+              echo "✅ valhalla_tiles_${code}.tar généré (single_dept)"
+            done
+          else
+            # 1. Télécharger tous les PBF de la zone
+            PBF_FILES=()
+            for code in "${TARGET_DEPTS[@]}"; do
+              IFS=':' read -r region slug _ _ _ _ <<< "${DEPT_MAP[$code]}"
+              pbf_url="https://download.openstreetmap.fr/extracts/europe/france/${region}/${slug}-latest.osm.pbf"
+              pbf_file="pbf_downloads/${slug}-latest.osm.pbf"
+              echo "Téléchargement ${code} (${slug})..."
+              curl -L -f --progress-bar -o "${pbf_file}" "${pbf_url}"
+              PBF_FILES+=("${pbf_file}")
+            done
+
+            # 2. Fusionner en un seul PBF cohérent (osmium merge)
+            rm -rf custom_files/*
+            if [ ${#PBF_FILES[@]} -eq 1 ]; then
+              cp "${PBF_FILES[0]}" "custom_files/zone_combined.osm.pbf"
+            else
+              echo "Fusion osmium de ${#PBF_FILES[@]} départements en un graphe unique..."
+              osmium merge "${PBF_FILES[@]}" -o "custom_files/zone_combined.osm.pbf"
+            fi
+
+            # 3. Compiler UNE SEULE FOIS le graphe Valhalla cohérent (GraphId 100% compatibles)
+            echo "Compilation Valhalla unique (toutes frontières connectées)..."
+            docker run --rm \
+              -v "$(pwd)/custom_files:/custom_files" \
+              -e build_elevation=False \
+              -e build_admins=True \
+              -e build_time_zones=True \
+              -e build_tar=True \
+              -e use_tiles_ignore_pbf=False \
+              -e serve_tiles=False \
+              ghcr.io/gis-ops/docker-valhalla/valhalla:latest
+
+            # 4. Extraire les .gph et découper un .tar modulaire par département
+            # Chaque .tar contient : toutes les tuiles niveau 2 du département (+0.15° de marge)
+            # + les tuiles niveau 0 et niveau 1 couvrantes issues du MÊME build cohérent.
+            mkdir -p custom_files/unpacked_tiles
+            tar -xf custom_files/valhalla_tiles.tar -C custom_files/unpacked_tiles
+
+            # Générer la table JSON des départements à découper
+            DEPTS_SPEC=""
+            for code in "${TARGET_DEPTS[@]}"; do
+              IFS=':' read -r _ _ minlat maxlat minlon maxlon <<< "${DEPT_MAP[$code]}"
+              DEPTS_SPEC+="${code}:${minlat}:${maxlat}:${minlon}:${maxlon};"
+            done
+
+            python3 - "${DEPTS_SPEC}" << 'PYEOF'
+          import os, sys, tarfile, math
+
+          tiles_root = "custom_files/unpacked_tiles"
+          out_dir = "release_assets"
+          margin = 0.15
+
+          # Taille des tuiles officielles Valhalla par niveau
+          LEVEL_CFG = {
+              0: (4.0, 90),     # 4° x 4° (autoroutes)
+              1: (1.0, 360),    # 1° x 1° (nationales)
+              2: (0.25, 1440),  # 0.25° x 0.25° (routes locales / campagne)
+          }
+
+          def tile_bbox(level, tile_id):
+              size, ncols = LEVEL_CFG[level]
+              row = tile_id // ncols
+              col = tile_id % ncols
+              min_lon = -180.0 + col * size
+              min_lat = -90.0 + row * size
+              return (min_lat, min_lat + size, min_lon, min_lon + size)
+
+          def intersects(a, b):
+              return not (a[1] < b[0] or a[0] > b[1] or a[3] < b[2] or a[2] > b[3])
+
+          # Indexer toutes les tuiles .gph générées
+          all_tiles = []
+          for root, _, files in os.walk(tiles_root):
+              for f in files:
+                  if not f.endswith(".gph"):
+                      continue
+                  full_path = os.path.join(root, f)
+                  rel_path = os.path.relpath(full_path, tiles_root).replace("\\", "/")
+                  parts = rel_path.split("/")
+                  level = int(parts[0])
+                  digits = "".join(parts[1:]).replace(".gph", "")
+                  tile_id = int(digits)
+                  all_tiles.append((level, tile_id, rel_path, full_path, tile_bbox(level, tile_id)))
+
+          print(f"Total .gph tiles built in coherent graph: {len(all_tiles)}")
+
+          for item in sys.argv[1].split(";"):
+              if not item.strip():
+                  continue
+              code, minlat, maxlat, minlon, maxlon = item.split(":")
+              dept_box = (
+                  float(minlat) - margin,
+                  float(maxlat) + margin,
+                  float(minlon) - margin,
+                  float(maxlon) + margin,
+              )
+              tar_path = os.path.join(out_dir, f"valhalla_tiles_{code}.tar")
+              count = 0
+              with tarfile.open(tar_path, "w") as tf:
+                  for level, tile_id, rel_path, full_path, tbox in all_tiles:
+                      if intersects(tbox, dept_box):
+                          tf.add(full_path, arcname=rel_path)
+                          count += 1
+              size_mb = os.path.getsize(tar_path) / (1024 * 1024)
+              print(f"✅ valhalla_tiles_{code}.tar : {count} tuiles .gph ({size_mb:.1f} Mo)")
+          PYEOF
+          fi
+
+      - name: Publish Tiles to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          name: "CoDriver Offline Maps (${{ github.event.inputs.release_tag }})"
+          body: |
+            ## Cartes hors-ligne Valhalla modulaires (tile_dir cohérent)
+            Ces archives contiennent les tuiles `.gph` issues d'un build cohérent (toutes frontières départementales et régionales connectées, y compris petites routes de campagne).
+
+            Zone / Départements compilés : `${{ github.event.inputs.department }}` (mode `${{ github.event.inputs.build_mode }}`)
+          files: release_assets/*.tar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
