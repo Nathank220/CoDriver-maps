@@ -1,0 +1,234 @@
+name: Build Valhalla Offline Maps
+
+on:
+  workflow_dispatch:
+    inputs:
+      department:
+        description: 'Code département (ex: 07, 26, 38, 13, 75, 2A) ou groupe (all_rhone_alpes, paca, aura)'
+        required: true
+        default: '07'
+        type: string
+      release_tag:
+        description: 'Tag de la release GitHub (doit correspondre à AppConfig.githubReleaseTag, par défaut: maps-v1)'
+        required: true
+        default: 'maps-v1'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prepare build environment
+        run: |
+          mkdir -p custom_files
+          mkdir -p release_assets
+
+      - name: Download OSM PBF extract and Build Tiles
+        run: |
+          # Table de mapping : Code Département -> Région OSM France : Slug PBF
+          declare -A DEPT_MAP=(
+            ["01"]="rhone_alpes:ain"
+            ["02"]="picardie:aisne"
+            ["03"]="auvergne:allier"
+            ["04"]="provence_alpes_cote_d_azur:alpes_de_haute_provence"
+            ["05"]="provence_alpes_cote_d_azur:hautes_alpes"
+            ["06"]="provence_alpes_cote_d_azur:alpes_maritimes"
+            ["07"]="rhone_alpes:ardeche"
+            ["08"]="champagne_ardenne:ardennes"
+            ["09"]="midi_pyrenees:ariege"
+            ["10"]="champagne_ardenne:aube"
+            ["11"]="languedoc_roussillon:aude"
+            ["12"]="midi_pyrenees:aveyron"
+            ["13"]="provence_alpes_cote_d_azur:bouches_du_rhone"
+            ["14"]="basse_normandie:calvados"
+            ["15"]="auvergne:cantal"
+            ["16"]="poitou_charentes:charente"
+            ["17"]="poitou_charentes:charente_maritime"
+            ["18"]="centre:cher"
+            ["19"]="limousin:correze"
+            ["2A"]="corse:corse_du_sud"
+            ["2B"]="corse:haute_corse"
+            ["21"]="bourgogne:cote_d_or"
+            ["22"]="bretagne:cotes_d_armor"
+            ["23"]="limousin:creuse"
+            ["24"]="aquitaine:dordogne"
+            ["25"]="franche_comte:doubs"
+            ["26"]="rhone_alpes:drome"
+            ["27"]="haute_normandie:eure"
+            ["28"]="centre:eure_et_loir"
+            ["29"]="bretagne:finistere"
+            ["30"]="languedoc_roussillon:gard"
+            ["31"]="midi_pyrenees:haute_garonne"
+            ["32"]="midi_pyrenees:gers"
+            ["33"]="aquitaine:gironde"
+            ["34"]="languedoc_roussillon:herault"
+            ["35"]="bretagne:ille_et_vilaine"
+            ["36"]="centre:indre"
+            ["37"]="centre:indre_et_loire"
+            ["38"]="rhone_alpes:isere"
+            ["39"]="franche_comte:jura"
+            ["40"]="aquitaine:landes"
+            ["41"]="centre:loir_et_cher"
+            ["42"]="rhone_alpes:loire"
+            ["43"]="auvergne:haute_loire"
+            ["44"]="pays_de_la_loire:loire_atlantique"
+            ["45"]="centre:loiret"
+            ["46"]="midi_pyrenees:lot"
+            ["47"]="aquitaine:lot_et_garonne"
+            ["48"]="languedoc_roussillon:lozere"
+            ["49"]="pays_de_la_loire:maine_et_loire"
+            ["50"]="basse_normandie:manche"
+            ["51"]="champagne_ardenne:marne"
+            ["52"]="champagne_ardenne:haute_marne"
+            ["53"]="pays_de_la_loire:mayenne"
+            ["54"]="lorraine:meurthe_et_moselle"
+            ["55"]="lorraine:meuse"
+            ["56"]="bretagne:morbihan"
+            ["57"]="lorraine:moselle"
+            ["58"]="bourgogne:nievre"
+            ["59"]="nord_pas_de_calais:nord"
+            ["60"]="picardie:oise"
+            ["61"]="basse_normandie:orne"
+            ["62"]="nord_pas_de_calais:pas_de_calais"
+            ["63"]="auvergne:puy_de_dome"
+            ["64"]="aquitaine:pyrenees_atlantiques"
+            ["65"]="midi_pyrenees:hautes_pyrenees"
+            ["66"]="languedoc_roussillon:pyrenees_orientales"
+            ["67"]="alsace:bas_rhin"
+            ["68"]="alsace:haut_rhin"
+            ["69"]="rhone_alpes:rhone"
+            ["70"]="franche_comte:haute_saone"
+            ["71"]="bourgogne:saone_et_loire"
+            ["72"]="pays_de_la_loire:sarthe"
+            ["73"]="rhone_alpes:savoie"
+            ["74"]="rhone_alpes:haute_savoie"
+            ["75"]="ile_de_france:paris"
+            ["76"]="haute_normandie:seine_maritime"
+            ["77"]="ile_de_france:seine_et_marne"
+            ["78"]="ile_de_france:yvelines"
+            ["79"]="poitou_charentes:deux_sevres"
+            ["80"]="picardie:somme"
+            ["81"]="midi_pyrenees:tarn"
+            ["82"]="midi_pyrenees:tarn_et_garonne"
+            ["83"]="provence_alpes_cote_d_azur:var"
+            ["84"]="provence_alpes_cote_d_azur:vaucluse"
+            ["85"]="pays_de_la_loire:vendee"
+            ["86"]="poitou_charentes:vienne"
+            ["87"]="limousin:haute_vienne"
+            ["88"]="lorraine:vosges"
+            ["89"]="bourgogne:yonne"
+            ["90"]="franche_comte:territoire_de_belfort"
+            ["91"]="ile_de_france:essonne"
+            ["92"]="ile_de_france:hauts_de_seine"
+            ["93"]="ile_de_france:seine_saint_denis"
+            ["94"]="ile_de_france:val_de_marne"
+            ["95"]="ile_de_france:val_d_oise"
+          )
+
+          build_single_dept() {
+            local code="$1"
+            # Nettoyer et normaliser le code (ex: 7 -> 07)
+            code=$(echo "$code" | tr '[:lower:]' '[:upper:]' | xargs)
+            if [ ${#code} -eq 1 ] && [[ "$code" =~ ^[0-9]$ ]]; then
+              code="0$code"
+            fi
+
+            local mapping="${DEPT_MAP[$code]}"
+            if [ -z "$mapping" ]; then
+              echo "❌ Erreur : Code département inconnu '$code' (valeurs acceptées : 01 à 95, 2A, 2B)"
+              return 1
+            fi
+
+            local region="${mapping%%:*}"
+            local slug="${mapping##*:}"
+            local pbf_url="https://download.openstreetmap.fr/extracts/europe/france/${region}/${slug}-latest.osm.pbf"
+            local tar_name="valhalla_tiles_${code}.tar"
+
+            echo ""
+            echo "========================================================"
+            echo "  Compilation Valhalla : Dép. $code ($slug)"
+            echo "  URL source : $pbf_url"
+            echo "========================================================"
+
+            rm -rf custom_files/*
+            echo "Téléchargement de ${slug}-latest.osm.pbf..."
+            curl -L -f --progress-bar -o "custom_files/${slug}-latest.osm.pbf" "${pbf_url}"
+
+            echo "Exécution de Docker Valhalla..."
+            docker run --rm \
+              -v "$(pwd)/custom_files:/custom_files" \
+              -e build_elevation=False \
+              -e build_admins=True \
+              -e build_time_zones=True \
+              -e use_tiles_ignore_pbf=False \
+              -e serve_tiles=False \
+              ghcr.io/gis-ops/docker-valhalla/valhalla:latest
+
+            if [ -f "custom_files/valhalla_tiles.tar" ]; then
+              mv "custom_files/valhalla_tiles.tar" "release_assets/${tar_name}"
+              local size=$(du -h "release_assets/${tar_name}" | cut -f1)
+              echo "✅ ${tar_name} généré avec succès (${size})"
+            else
+              echo "❌ Erreur : valhalla_tiles.tar non généré pour le département ${code}"
+              return 1
+            fi
+          }
+
+          RAW_INPUT="${{ github.event.inputs.department }}"
+          CLEAN_INPUT=$(echo "$RAW_INPUT" | tr '[:upper:]' '[:lower:]' | xargs)
+
+          case "${CLEAN_INPUT}" in
+            "all_rhone_alpes"|"rhone_alpes")
+              for c in 01 07 26 38 42 69 73 74; do
+                build_single_dept "$c"
+              done
+              ;;
+            "aura")
+              for c in 01 07 26 38 42 69 73 74 03 15 43 63; do
+                build_single_dept "$c"
+              done
+              ;;
+            "paca")
+              for c in 04 05 06 13 83 84; do
+                build_single_dept "$c"
+              done
+              ;;
+            "corse")
+              for c in 2A 2B; do
+                build_single_dept "$c"
+              done
+              ;;
+            *)
+              # Liste séparée par virgule ou code unique
+              IFS=',' read -ra DEPTS <<< "$RAW_INPUT"
+              for dept in "${DEPTS[@]}"; do
+                # Supprimer les éventuels suffixes d'anciennes versions (ex: 07_ardeche -> 07)
+                code_only=$(echo "$dept" | cut -d'_' -f1 | tr '[:lower:]' '[:upper:]' | xargs)
+                build_single_dept "$code_only"
+              done
+              ;;
+          esac
+
+      - name: Publish Tiles to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          name: "CoDriver Offline Maps (${{ github.event.inputs.release_tag }})"
+          body: |
+            ## Cartes hors-ligne Valhalla compilées automatiquement
+            Ces archives contiennent les tuiles de routage GPS hors-ligne pour l'application CoDriver.
+            
+            Départements inclus dans ce build :
+            - ${{ github.event.inputs.department }}
+          files: release_assets/*.tar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
